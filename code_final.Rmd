@@ -1,0 +1,620 @@
+---
+title: "code_final"
+output: html_document
+date: "2024-01-17"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r packages needed}
+library(tidyverse)
+library(Seurat)
+library(SeuratObject)
+library(ggplot2)
+library(ggraph)
+library(ggpubr)
+library(ComplexHeatmap)
+library(reshape2)
+library(stringr)
+library(Hmisc)
+library(scCustomize)
+library(patchwork)
+library(SCopeLoomR)
+library(Signac)
+library(data.table)
+```
+
+```{r preprocessing}
+# Parse Human and Mouse 10X data:
+metadata <- read_csv('/home/jon/Documents/hackam_lab/scRNAseq/Maame_Mouse_SBR_organoids/data/tidy/metadata.csv')
+metadata <- metadata %>% filter(group != 'organoid')
+
+for (species in c('human', 'mouse')) {
+  # data:
+  data_dir <- paste('/media/jon/1_HACKAM_SEQUENCING_BACKUP/scRNAseq/COUNT/',toupper(species),sep='')
+  
+  filenames <- metadata$filename
+  human_matrix <- read_10X_directory(data_dir, filenames)
+  human_meta <- tibble(filename = human_matrix[[2]]) %>% inner_join(metadata)
+  human_meta <- as.data.frame(human_meta)
+  rownames(human_meta) <- colnames(human_matrix[[1]])
+  
+  human_seurat <- CreateSeuratObject(human_matrix[[1]], meta.data = human_meta)
+  saveRDS(human_seurat, paste(output_dir, '/', species, '_seurat.Rds', sep = ''))
+  
+ # Filter dataset:
+  human_seurat <- readRDS(paste(output_dir, '/', species, '_seurat.Rds', sep = ''))
+  if (species == 'human') {
+    human_fltr <- filter_seurat(human_seurat, min.rna = 00, max.rna = 10000, perc.mt = 100, species = 'hs')
+  } else {
+    human_fltr <- filter_seurat(human_seurat, min.rna = 00, max.rna = 10000, perc.mt = 100, species = 'ms')
+  }
+  
+  VlnPlot(human_fltr, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+  filter_tibble <- tibble(nfeature_RNA = human_fltr$nFeature_RNA, nCount_RNA = human_fltr$nCount_RNA)
+  filter_tibble <- filter_tibble %>% filter(nfeature_RNA > 2000)
+  ggplot(filter_tibble, aes(y=nfeature_RNA, x=nCount_RNA)) +
+    geom_hex()
+  FeatureScatter(human_fltr, feature1 = "nCount_RNA", feature2 = "percent.mt")
+  FeatureScatter(human_fltr, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+  
+  min.rna <- 300
+  if (species == 'human') {
+    human_fltr <- filter_seurat(human_seurat, min.rna = min.rna, max.rna = 4000, perc.mt = 25, species = 'hs')
+  } else {
+    human_fltr <- filter_seurat(human_seurat, min.rna = min.rna, max.rna = 4000, perc.mt = 25, species = 'ms')
+  }
+  
+  saveRDS(human_fltr, paste(output_dir, '/', species, '_seurat_fltr.Rds', sep = ''))
+  
+} 
+```
+
+```{r clustering}
+# 2_CLUSTERING HUMAN DATA
+# SBR VS SHAM
+
+rm(list = ls())
+
+source('/home/jon/Documents/hackam_lab/scRNAseq/functions_clustering.R')
+source('/home/jon/Documents/hackam_lab/code/GeneSetEnrichment_functions.R')
+output_dir <- '/home/jon/Documents/hackam_lab/scRNAseq/Maame_Mouse_SBR_organoids/data/interim'
+figure_dir <- '/home/jon/Documents/hackam_lab/scRNAseq/Maame_Mouse_SBR_organoids/figures/exploratory_figures'
+
+species <- 'human'
+pc <- 7
+
+  pc <- 7
+  fltrd_seurat <- readRDS(paste('/home/jon/Documents/hackam_lab/scRNAseq/Maame_Mouse_SBR_organoids/data/tidy/',species,'_seurat_fltr.Rds', sep=''))
+  human_fltr <- fltrd_seurat
+  human_fltr <- subset(human_fltr, subset = group %in% c('SHAM','SBR'))
+  
+  human_barcodes <- scan(paste(output_dir, '/clustering/human_barcodes', sep = ''), what = '')
+  human_fltr@meta.data$barcode <- colnames(human_fltr@assays$RNA@data)
+  human_fltr <- subset(human_fltr, subset = barcode %in% human_barcodes)
+  
+  human_fltr <- FindVariableFeatures(human_fltr, selection.method = "vst", nfeatures = 2000)
+  human_fltr <- ScaleData(human_fltr)
+  human_fltr <- RunPCA(human_fltr, features = VariableFeatures(object = human_fltr))
+  plot3 <- VizDimLoadings(human_fltr, dims = 1:2, reduction = "pca")
+  plot4 <- DimPlot(human_fltr, reduction = "pca")
+  plot5 <- ElbowPlot(human_fltr)
+  
+  png(paste(figure_dir, '2_clustering_clusteringParameters_decon_',pc,'_',species,'.png', sep = ''), height = 300, width = 300, units = 'mm', res = 300)
+  print(ggarrange(plot3, plot4, plot5,
+                      labels = c("A", "B", "C"),
+                      ncol = 2, nrow = 2))
+  dev.off()
+  
+# COMPUTE UMAP PROJECTION:
+  ElbowPlot(human_fltr)
+  human_fltr <- FindNeighbors(human_fltr, dims = 1:pc)
+  human_fltr <- FindClusters(human_fltr, resolution = 0.4)
+  human_fltr <- RunUMAP(human_fltr, dims = 1:pc) #metric = 'manhattan', repulsion.strength = 0.005, n.neighbors = 1000, min.dist = 0.3)
+  
+  png(paste(figure_dir, '/clustering/2_clustering_UMAP_SbrSham_decon_seuratgen_',pc,'_',species,'.png', sep =''), height = 125, width = 125, units = 'mm', res = 300)
+  print(DimPlot(human_fltr, reduction = 'umap', label = T))
+  dev.off()
+   
+  meta_umap <- as_tibble(human_fltr@meta.data)
+  meta_umap$umap_1 <- human_fltr@reductions$umap@cell.embeddings[,1]
+  meta_umap$umap_2 <- human_fltr@reductions$umap@cell.embeddings[,2]
+  meta_umap$barcode <- colnames(human_fltr@assays$RNA@data)
+  meta_umap$cluster <- human_fltr@active.ident
+  write.csv(meta_umap, paste(output_dir, '/clustering/2_clustering_2dCoordinatesMetadata_decon_',pc,'_',species,'.csv', sep = ''), row.names = F)
+  
+  saveRDS(human_fltr, paste(output_dir, '/clustering/2_clustering_SeuratObject_complete_',pc,'_',species,'.Rds', sep = ''))
+  human_fltr <- readRDS(paste(output_dir, '/clustering/2_clustering_SeuratObject_complete_',pc,'_',species,'.Rds', sep = ''))
+```
+
+```{r cell_id}
+#load our data and simmons data for comparison
+obj <- readRDS(paste(data_dir, "2_clustering_SeuratObject_complete_7_human.Rds", sep = ''))
+simmons <- readRDS("/home/hackam/Documents/NEC v Ctrl/interim/all_compartments.RDS")
+
+source("/home/hackam/Documents/functions_clustering.R")
+
+#correlate data to published cell ids
+gene.list <- intersect(simmons@assays$RNA@var.features, obj@assays$RNA@var.features)
+cor <- cluster_correlation(obj, simmons, gene.list)
+
+Heatmap(cor)
+
+#check marker genes:
+#enterocytes
+VlnPlot(obj, features = c("APOE", "FABP1", "FABP2", "KLF5", "ANPEP", "VIL1", "CDH17"))
+
+#stem-like fibroblast
+VlnPlot(obj, features = c("COL1A1", "COL1A2", "COL3A1", "COL6A2", "COL6A3", "FBN1", "IGFBP6", "FSTL1", "SPARC", "DCN"))
+
+#mature fibroblast
+VlnPlot(obj, features = c("COL1A1", "COL1A2", "COL3A1", "COL6A2", "COL6A3", "FBN1", "MMP2", "IGFBP6", "FSTL1", "SPARC", "DCN"))
+
+#myeloid 1
+VlnPlot(obj, features = c("CEBPB", "TLR2"))
+
+#myeloid 2
+VlnPlot(obj, features = c("HLA-DQB1", "MRC1", "AIF1"))
+
+#myeloid 3
+VlnPlot(obj, features = c("CREG1", "CTSS", "CD9", "CAPG"))
+
+#mucin producin(g)
+VlnPlot(obj, features = c("MUC1", "MUC5AC"))
+
+#dead & dying -> remove from further analysis
+VlnPlot(obj, features = c("MTRNR2L1", "MTRNR2L2"))
+```
+
+```{r make umap}
+obj <- readRDS(paste(data_dir, "2_clustering_SeuratObject_complete_7_human.Rds", sep = ''))
+no8 <- subset(obj, idents = c(0:7))
+
+#set color-blind friendly palettes
+pal <- c("0" = "#EE8866", "1" = "#EEDD88", "2" = "#AAAA00", "3" = "#BBCC33", "4" = "#44BB99", "5" = "#99DDFF", "6" = "#77AADD", "7" = "#FFAABB")
+group_pal <- c("SBR" = "#F8766D", "SHAM" = "#00BFC4")
+
+#umap by cluster
+DimPlot(no8, label = F, pt.size = 0.05, cols = pal) +
+  theme(axis.title = element_blank(), axis.text = element_blank(), axis.line = element_line(size = 0.09), axis.ticks = element_line(size = 0.09)) +
+  NoLegend()
+ggsave(paste(figure_dir, "maameumap_no8.png", sep = ''), height = 1.9, width = 2 , units = 'in', dpi = 500)
+
+#umap by group 
+set.seed(23)
+DimPlot(no8, label = F, pt.size = 0.05, group.by = 'group', shuffle = TRUE, cols = group_pal) +
+  theme(axis.title = element_blank(), axis.text = element_blank(), axis.line = element_line(size = 0.09), axis.ticks = element_line(size = 0.09)) +
+  labs(title = element_blank()) +
+  NoLegend()
+ggsave(paste(figure_dir, "maameumapbygroup2_no8.png", sep = ''), height = 1.9, width = 2 , units = 'in', dpi = 500)
+```
+
+```{r make barplot of cell-type per sample by group}
+meta_umap <- no8@meta.data
+meta_umap_cut <- meta_umap %>% select(sample_name, seurat_clusters)
+meta_umap_cut_c <- meta_umap_cut %>% group_by(sample_name, seurat_clusters) %>% count()
+meta_total <-meta_umap_cut %>% group_by(sample_name) %>% count()
+meta_counts <- meta_umap_cut_c %>% inner_join(meta_total, by = "sample_name")
+meta_counts <- meta_counts %>% rename("n" = "n.x", "total" = "n.y")
+meta_counts <- meta_counts %>% mutate(perc = (n / total) * 100)
+meta_counts$seurat_clusters <- as.factor(meta_counts$seurat_clusters)
+
+ggplot(meta_counts, aes(fill = seurat_clusters, y=perc, x = sample_name))+
+  geom_bar(position = "stack", stat = "identity", show.legend = F) +
+  scale_fill_manual(values = pal) +
+  theme(axis.text = element_blank(), 
+        axis.title = element_blank(), 
+        axis.ticks.x = element_blank(),
+        axis.ticks.y = element_line(size = 0.6),
+        panel.background = element_rect(colour = "gray99", fill = "gray99"), 
+        panel.grid.minor = element_line(color = "gray80", size = 0.25), 
+        panel.grid.major = element_line(color = "gray80", size = 0.25)) 
+  
+ggsave(paste(figure_dir, "bar_chart.png", sep = ''), height = 1.5, width = 2.5, units = 'in', dpi = 500)
+```
+
+```{r heatmap of top DEGs and marker genes of interest}
+diffExp <- read_csv(paste(data_dir, "2_clustering_DifferentialExpression_decon_7_human.csv", sep = ''))
+meta_umap <- read_csv(paste(data_dir, "2_clustering_2dCoordinatesMetadata_decon_7_human.csv", sep = ''))
+human_fltr <- readRDS(paste(data_dir, "2_clustering_SeuratObject_complete_7_human.Rds", sep = ''))
+
+diffExp <- diffExp %>% filter(cluster != 8)
+meta_umap <- meta_umap %>% filter(seurat_clusters != 8)
+human_fltr <- subset(human_fltr, idents = c(0:7))
+
+diffExp_fltr <- diffExp %>% group_by(cluster) %>% top_n(10, wt = avg_log2FC)
+diffExp_fltr_add <- diffExp %>% filter(gene %in% c('SI','VIL1','ACE2','ACE','KLF5','IGFBP5','TIMP3','WNT4','IGFBP7', 'COL3A1','RBP1','COL1A2','COL1A1','LPL','LGALS3','FABP5','S100A4','IGF1','VIM','EGR2')) %>% 
+group_by(gene) %>% top_n(1, wt = avg_log2FC)
+diffExp_fltr <- bind_rows(diffExp_fltr, diffExp_fltr_add) %>% distinct() 
+diffExp_fltr$cluster <- factor(diffExp_fltr$cluster, levels = c(2,5,7,4,0,3,1,6))   # PC-specific input
+diffExp_fltr <- diffExp_fltr %>% arrange(cluster)
+genes_diffexp <- unique(diffExp_fltr$gene)
+
+final_mat <- matrix(rep(0, length(genes_diffexp)), ncol = 1)
+clusters <- factor(unique(diffExp$cluster), levels = c(2,5,7,4,0,3,1,6))
+clusters <- sort(clusters)
+for (clust in clusters) {
+  mat_bc <- meta_umap[meta_umap$cluster == clust,]$barcode
+  mat <- as.matrix(human_fltr@assays$RNA@data[genes_diffexp,mat_bc])
+  mat <- rowMeans(mat)
+  #colnames(mat) <- clust#rep(clust, ncol(mat))
+  final_mat <- cbind(final_mat, mat)
+}
+
+column_gene_names <- c("APOA1", "RBP2", "FABP1", "APOA4", "VIL1", "SI", "KLF5", "ACE2", "ACE", "APOB", "MTRNR2L8", "MTRNR2L1", "APOC2", "IGFBP5", "ENPP2", "CCDC80", "TIMP3", "CDH11", "WNT4", "COL1A1", "COL1A2", "COL3A1", "SFRP2", "IGFBP7", "RBP1", "IGF1", "SOD2", "FTH1", "NFKBIA", "INHBA", "LPL", "LGALS3", "TYROBP", "CD9", "APOE", "FABP5", "EGR2", "VIM", "MRC1", "AIF1", "S100A4", "TFF1", "TFF2", "MT-CO2", "MT-ATP6", "SPINK1")
+
+final_mat <- final_mat[,-1]
+colnames(final_mat) <- clusters
+scaled_mat = t(t(final_mat))
+anno <- anno_mark(at = c(1, 2, 5, 7, 11:15, 20:23, 26, 28, 30, 32, 34, 36:39, 44, 47:49, 51, 53, 57, 58, 60, 62, 65, 66, 69:72, 77, 79, 83:86, 88, 91 ), labels = column_gene_names, which = "column", labels_gp = gpar(fontsize = 6))
+scaled_mat2 <- t(scaled_mat)
+
+Heatmap(scaled_mat2, row_names_gp = gpar(fontsize = 10), cluster_rows = F, cluster_columns = F, top_annotation = columnAnnotation(mark = anno, gp = gpar(fontsize = 14)), column_names_gp = gpar(fontsize = 0))
+```
+
+```{r gene set enrichment analysis}
+obj <- readRDS(paste(data_dir, "2_clustering_SeuratObject_complete_7_human.Rds", sep = ''))
+Idents(obj) <- "group"
+
+source("/home/hackam/Documents/scripts/GeneSetEnrichment_functions.R")
+
+GSEA_2_v_5 <- subset(obj, idents = c(2, 5))
+GSEA_7_v_4 <- subset(obj, idents = c(7, 4))
+
+GSEA_2_5 <- seurat_gsea_cluster(seurat_object = GSEA_2_v_5, database = "BP", species = "Hs")
+GSEA_7_4 <- seurat_gsea_cluster(seurat_object = GSEA_7_v_4, database = "BP", species = "Hs")
+
+GSEA_2_5 <- GSEA_2_5[[1]]
+GSEA_7_4 <- GSEA_7_4[[1]]
+
+GSEA_2_5 <- GSEA_2_5 %>% filter(p.adjust < 0.05) %>% filter(cluster == '2')
+GSEA_7_4 <- GSEA_7_4 %>% filter(p.adjust < 0.05) %>% filter(cluster == '7')
+
+write.csv(GSEA_2_5, paste(data_dir, "GSEA_2_5.csv", sep = ''))
+write.csv(GSEA_7_4, paste(data_dir, "GSEA_7_4.csv", sep = ''))
+```
+
+```{r gsea network plot}
+#*manually combined significant pathways into broader umbrella terms to generate gsea_up and gsea_down from exported CSVs (described in methods)
+#load gsea output 
+gsea_df <- read.csv(paste(data_dir, "gsea_all_select.csv", sep = ''))
+
+gsea_df_up <- gsea_df %>% filter(NES > 0)
+gsea_df_down <- gsea_df %>% filter(NES < 0)
+
+gsea_df_up <- gsea_df_up %>% dplyr::rename(Old_Descriptions = Description, Description = New.Description)
+gsea_df_down <- gsea_df_down %>% dplyr::rename(Old_Descriptions = Description, Description = New.Description)
+
+#load new combined umbrella terms and combine with gsea output
+gsea_up_desc <- read_csv(paste(data_dir, "gsea_up.csv", sep = ''))
+gsea_down_desc <- read_csv(paste(data_dir, "gsea_down.csv", sep = ''))
+
+gsea_up_desc <- gsea_up_desc %>% rename('New_Description' = '...3') %>% select(Description, New_Description)
+gsea_down_desc <- gsea_down_desc %>% rename('New_Description' = '...3') %>% select(Description, New_Description)
+
+gsea_down <- gsea_df_down %>% inner_join(gsea_down_desc)
+gsea_up <- gsea_df_up %>% inner_join(gsea_up_desc)
+
+gsea_up <- gsea_up %>% dplyr::rename(Old_Description = Description, Description = New_Description)
+gsea_down <- gsea_down %>% dplyr::rename(Old_Description = Description, Description = New_Description)
+
+#make network plot:
+#make new df for edges
+edges <- tibble()
+#to df add description, gene, and number for each gene, number starts at 1 and counts up for that description, starts over again at one fro next description
+for (i in c(1:nrow(gsea_df_up))) {
+  gsea_row_genes <- unlist(str_split(gsea_df_up[i,]$core_enrichment, '/'))
+  edge_add <- tibble(Description = gsea_df_up[i,]$Description, Gene = gsea_row_genes, num = c(1:length(gsea_row_genes)))
+  edges = bind_rows(edges, edge_add)
+}
+#determine how many times a gene shows up, and remove if it is only present once (gene should only appear once per description, so this would leave only genes that connect pathways
+edges_sum <- edges %>%
+  group_by(Gene) %>%
+  summarize(num = n()) %>%
+  filter(num > 1)
+#remove number column and delete duplicates - needs to happen when combining terms as the gene could show up more than once per description now
+edges <- edges %>% select(Description, Gene)
+edges <- edges %>% distinct() 
+#recombine with edges sum to get weight of how many pathways within the big term contain the gene
+edges_1 <- edges %>% inner_join(edges_sum)
+#make list with all descriptions and another list with all descriptions and all genes
+node_list <- unique(c(edges$Description, edges$Gene))
+node_list_gsea <- unique(edges$Description)
+nodes <- tibble(node = node_list)
+nodes_gsea <- tibble(node = node_list_gsea)
+#make row index into column so each description is assigned unique number ID
+nodes_graph <- nodes %>%
+  rownames_to_column("id")
+#create a list of connections between descriptions based on shared genes
+edges_graph <- edges_1 %>% 
+  left_join(nodes_graph, by = c("Description" = "node")) %>%
+  rename(from = id) %>%
+  left_join(nodes_graph, by = c("Gene" = "node")) %>%
+  rename(to = id)
+#transform
+edges_graph <- edges_graph %>% select(from, to)
+
+edges_graph <- edges_graph %>%
+  group_by(to) %>%
+  mutate(Order = seq_along(to)) %>%
+  spread(key = Order, value = from)
+
+edges_graph <- edges_graph[,-1]
+#changing edges_graph to make network manually - col numbers changed based on down v up 
+edges_mod <- edges_graph %>% pivot_longer(cols = c("2", "3", "4", "5", "6", "7"), names_to = "name", values_to = "GO")
+edges_mod <- edges_mod[,-2]
+edges_mod <- edges_mod %>% drop_na(GO)
+#creating pieces needed for graph
+nodes_mine = nodes_graph
+edges_mine = edges_mod
+
+n=nrow(nodes)
+m=nrow(edges)
+#add more info to nodes mine so nodes can be coded by NES or p val
+gsea_df_node_mods <- gsea_df %>% select(Description, p.adjust, NES)
+gsea_df_node_mods1 <- gsea_df_node_mods %>% 
+  group_by(Description) %>%
+  summarise(across(c(p.adjust, NES), mean))
+nodes_mine <- nodes_mine %>% inner_join(gsea_df_node_mods1, by = c("node" = "Description"))
+#how many times does gene repeat with description
+edges_count <- edges_mine %>% group_by_all() %>% count()
+edges_mine <- edges_mine %>% inner_join(edges_count)
+edges_mine <- edges_mine %>% rename(weight = n)
+#create DF for graph making
+network <- tbl_graph(nodes_mine, edges_mine)
+#make graph with labels
+set.seed(45)
+ggraph(network, layout = "fr") + 
+  geom_node_point(aes(colour = NES, size = 2)) + 
+  geom_edge_link(aes(width = weight), alpha = 0.3) + 
+  scale_edge_width(range = c(0.5, 3)) +
+  labs(edge_width = "Shared Genes") +
+  geom_node_text(aes(label = node, colour = NES), repel = TRUE) +
+  scale_color_gradient(low = "purple", high = "red") +
+  theme_graph() 
+ggsave(paste(figure_dir, "networklabeled_up_fr.png", sep = ''), height = 500, width = 500, units = 'mm', dpi = 300)
+#make graph without labels to add manually
+set.seed(45)
+ggraph(network, layout = "fr") + 
+  geom_node_point(aes(colour = NES, size = 2)) + 
+  geom_edge_link(aes(width = weight), alpha = 0.3) + 
+  scale_edge_width(range = c(0.5, 3)) +
+  labs(edge_width = "Shared Genes") +
+  scale_color_gradient(low = "purple", high = "red") +
+  theme_graph() 
+ggsave(paste(figure_dir, "networkunlabeled_up_fr.png", sep = ''), height = 500, width = 500, units = 'mm', dpi = 300)
+
+#repeat code for downregulated genes - new graph code: 
+set.seed(45)
+ggraph(network, layout = "fr") + 
+  geom_node_point(aes(colour = NES, size = 2)) + 
+  geom_edge_link(aes(width = weight), alpha = 0.3) + 
+  scale_edge_width(range = c(0.5, 3)) +
+  labs(edge_width = "Shared Genes") +
+  geom_node_text(aes(label = node, colour = NES), repel = TRUE) +
+  scale_color_gradient(low = "blue", high = "purple") +
+  theme_graph() 
+ggsave(paste(figure_dir, "networklabeled_down_fr.png", sep = ''), height = 500, width = 500, units = 'mm', dpi = 300)
+
+set.seed(45)
+ggraph(network, layout = "fr") + 
+  geom_node_point(aes(colour = NES, size = 2)) + 
+  geom_edge_link(aes(width = weight), alpha = 0.3) + 
+  scale_edge_width(range = c(0.5, 3)) +
+  labs(edge_width = "Shared Genes") +
+  scale_color_gradient(low = "blue", high = "purple") +
+  theme_graph() 
+ggsave(paste(figure_dir, "networkunlabeled_down_fr.png", sep = ''), height = 500, width = 500, units = 'mm', dpi = 300)
+
+#determine genes of interest
+obj <- readRDS(paste(data_dir, "2_clustering_SeuratObject_complete_7_human.Rds", sep = ''))
+DEGs_2_v_5 <- FindMarkers(obj, ident.1 = 2, ident.2 = 5)
+DEGS_7_v_4 <- FindMarkers(obj, ident.1 = 7, ident.2 = 4)
+DEGS_combined <- rbind(DEGs_2_v_5, DEGS_7_v_4)
+write_csv(DEGS_combined, paste(data_dir, "DEGs_WithinEachCluster_SBRvSHAM.csv", sep = ''))
+
+DEGs_WithinEachCluster_SBRvsSHAM <- read_csv(paste(data_dir, "DEGs_WithinEachCluster_SBRvsSHAM.csv", sep = ''))
+DEGs <- DEGs_WithinEachCluster_SBRvsSHAM %>% filter(cluster == 2 | cluster == 7)
+overlaps <- edges_1 %>% inner_join(DEGs, by = c("Gene" = "gene"))
+sig_overlaps2 <- overlaps %>% filter(p_val < 0.05)
+sig_overlaps2 <- sig_overlaps2 %>% select(Description, Gene, avg_log2FC, cluster)
+```
+
+```{r SLC39A4 & SLC39A5 feature & violin plots}
+obj <- readRDS(paste(data_dir, "2_clustering_SeuratObject_complete_7_human.Rds", sep = ''))
+no8 <- subset(obj, idents = c(0:7))
+
+FeaturePlot(no8, features = 'SLC39A4', pt.size = 0.05) + 
+  labs(title = element_blank()) +
+  theme(axis.title = element_blank(), axis.text = element_blank(), axis.line = element_line(size = 0.09), axis.ticks = element_line(size = 0.09)) 
+#ggsave(paste(figure_dir, "slc39a4feature_no8.png", sep = ''), height = 2, width = 2 , units = 'in', dpi = 500)
+
+FeaturePlot(no8, features = 'SLC39A5', pt.size = 0.05) + 
+  labs(title = element_blank()) +
+  theme(axis.title = element_blank(), axis.text = element_blank(), axis.line = element_line(size = 0.09), axis.ticks = element_line(size = 0.09)) 
+#ggsave(paste(figure_dir, "slc39a5feature_no8.png", sep = ''), height = 2, width = 2 , units = 'in', dpi = 500)
+
+VlnPlot(no8, features = "SLC39A4", group.by = "group", pt.size = 1, cols = group_pal) +
+  ylim(0, 4) +
+  stat_compare_means(aes(label = ..p.signif..), label.x = 1.5, label.y = 3.8) &
+  theme(panel.background = element_rect(fill = "transparent"),
+      plot.background = element_rect(fill = "transparent", colour = NA)) 
+#ggsave(paste(figure_dir, "SLC39A4_vln_group_no8.png", sep = ''), width = 75, height = 100, dpi = 300, units = "mm", bg="transparent")
+
+VlnPlot(no8, features = "SLC39A5", group.by = "group", sort = "decreasing") +
+  stat_compare_means() &
+  theme(panel.background = element_rect(fill = "transparent"),
+      plot.background = element_rect(fill = "transparent", colour = NA)) 
+#ggsave(paste0(figure_dir, "PVAL5.png"))
+```
+
+```{r plots from GSE130113 dataset}
+brad <- readRDS(paste(data_dir, 'GSE130113_seurat.Rds', sep = ''))
+
+DimPlot(brad, label = T, pt.size = 0.05, label.size = 1.5) +
+  theme(axis.title = element_blank(), axis.text = element_blank(), axis.line = element_line(size = 0.09), axis.ticks = element_line(size = 0.09)) +
+  NoLegend()
+
+FeaturePlot(brad, features = 'Slc39a4', pt.size = 0.05) + 
+  labs(title = element_blank()) +
+  theme(axis.title = element_blank(), axis.text = element_blank(), axis.line = element_line(size = 0.09), axis.ticks = element_line(size = 0.09)) +
+  NoLegend()
+
+FeaturePlot(brad, features = 'Slc39a5', pt.size = 0.05) + 
+  labs(title = element_blank()) +
+  theme(axis.title = element_blank(), axis.text = element_blank(), axis.line = element_line(size = 0.09), axis.ticks = element_line(size = 0.09)) +
+  NoLegend()
+```
+
+```{r prep data for scenic *run in python, jupyter notebook also provided}
+obj <- readRDS(paste(data_dir, "2_clustering_SeuratObject_complete_7_human.Rds", sep = ''))
+no8 <- subset(obj, idents = c(0:7))
+
+exprMat <- GetAssayData(object = no8, slot = "counts")
+cellInfo <- data.frame(seuratCluster = Idents(no8))
+
+loom <- build_loom(paste(data_dir, "organoid_no8.loom", sep = ''), dgem = exprMat)
+loom <- add_cell_annotation(loom, cellInfo)
+close_loom(loom)
+```
+
+```{r post-scenic analysis}
+#identify co-expressed genes
+all_data <- as.data.frame(no8@assays$RNA@data)
+all_data <- rownames_to_column(all_data, var = "genes")
+slcs <- all_data %>% filter(genes == "SLC39A4" | genes == "SLC39A5")
+others <- all_data %>% filter(genes != "SLC39A4") %>% filter(genes != "SLC39A5")
+slcs <- column_to_rownames(slcs, var = "genes")
+others <- column_to_rownames(others, var = "genes")
+
+slc_cor <- t(as.matrix(slcs))
+others_cor <- t(as.matrix(others))
+
+cor_genes <- cor(slc_cor, others_cor, method = "spearman")
+cor_genes <- t(cor_genes)
+cor_genes <- as.data.frame(cor_genes)
+
+cor_genes_top <- cor_genes %>% filter(SLC39A5 >= 0.5 | SLC39A4 >= 0.5)
+cor_genes <- rownames_to_column(cor_genes, var = "genes")
+cor_genes_top <- rownames_to_column(cor_genes_top, var = "genes")
+cor_genes_top <- cor_genes_top %>% select(genes)
+
+#correlate to TFs
+tfs <-c("TEF", "NR2C1", "NR1I2", "IRF7", "ELF3", "DBP", "PPARA", "PITX2", "NR3C1", "NFE2L2", "KLF5", "KLF3", "KDM5B", "HNF4G", "HNF4A", "ESRRA", "CREB1")
+
+tfs <- as.data.frame(tfs)
+tfs <- tfs %>% rename(genes = tfs)
+
+checking_genes <- left_join(cor_genes_top, all_data, by = "genes")
+checking_genes <- checking_genes %>% column_to_rownames(var = "genes")
+checking_genes_mat <- t(as.matrix(checking_genes))
+
+tfs_all <- left_join(tfs, all_data, by = "genes")
+tfs_all <- tfs_all %>% column_to_rownames(var = "genes")
+tfs_all_mat <- t(as.matrix(tfs_all))
+
+cor_diff_2 <- rcorr(checking_genes_mat, tfs_all_mat)
+
+cor_diff_3 <- cor_diff_2$r
+cor_diff_3 <- cor_diff_3[1:77, 78:86]
+melted_3 <- melt(cor_diff_3)
+
+melted_3 <- melted_3 %>% filter(Var1 != "KLF5") %>% filter(Var1 != "HNF4G") %>% filter(Var1 != "ESRRA")
+
+ggplot(data = melted_3, aes(x=Var1, y= Var2, fill=value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", limits = c(NA, 1.0)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 10, family = "Arial"), axis.text.y = element_text(size = 10, family = "Arial")) +
+  xlab("Genes with highest correlated expression to SLC39A4 and SLC39A5") +
+  ylab("TFs") +
+  labs(element_text(family = "Arial", size = 12))
+```
+
+```{r violin and boxplots}
+#SHAM-SBS TF Vln Plots
+VlnPlot(no8, features = "KLF5", group.by = "group", pt.size = 1, cols = group_pal) +
+  ylim(0, 5) +
+  stat_compare_means(aes(label = ..p.signif..), label.x = 1.5, label.y = 4.8) &
+  theme(panel.background = element_rect(fill = "transparent"),
+      plot.background = element_rect(fill = "transparent", colour = NA))
+ggsave(paste(figure_dir, "KLF5_vln_group_no8.png", sep = ''), width = 75, height = 100, dpi = 300, units = "mm", bg="transparent")
+
+VlnPlot(no8, features = "ESRRA", group.by = "group", pt.size = 1, cols = group_pal) +
+  ylim(0, 4) +
+  stat_compare_means(aes(label = ..p.signif..), label.x = 1.5, label.y = 3.8) &
+  theme(panel.background = element_rect(fill = "transparent"),
+      plot.background = element_rect(fill = "transparent", colour = NA))
+ggsave(paste(figure_dir, "ESRRA_vln_group_no8.png", sep = ''), width = 75, height = 100, dpi = 300, units = "mm", bg="transparent")
+
+VlnPlot(no8, features = "HNF4G", group.by = "group", pt.size = 1, cols = group_pal)  +
+  ylim(0, 4)+
+  stat_compare_means(aes(label = ..p.signif..), label.x = 1.5, label.y = 3.8) &
+  theme(panel.background = element_rect(fill = "transparent"),
+      plot.background = element_rect(fill = "transparent", colour = NA))
+ggsave(paste(figure_dir, "HNF4G_vln_group_no8.png", sep = ''), width = 75, height = 100, dpi = 300, units = "mm", bg="transparent")
+
+VlnPlot(no8, features = "HNF4A", group.by = "group", pt.size = 1, cols = group_pal) +
+  ylim(0, 4) +
+  stat_compare_means(aes(label = ..p.signif..), label.x = 1.5, label.y = 3.2) &
+  theme(panel.background = element_rect(fill = "transparent"),
+      plot.background = element_rect(fill = "transparent", colour = NA))
+ggsave(paste(figure_dir, "HNF4A_vln_group_no8.png", sep = ''), width = 75, height = 100, dpi = 300, units = "mm", bg="transparent")
+
+#TF AUC Boxplots
+loom <- SCopeLoomR::open_loom("/home/hackam/Documents/Maame_Organoid/scenic no 8 redo/organoid_scenic_integrated-output.loom", mode = "r")
+regulonAUC <- get_regulons_AUC(loom, column.attr.name = "RegulonsAUC")
+AUCmat <- AUCell::getAUC(regulonAUC)
+rownames(AUCmat) <- gsub("[_(+)]", "", rownames(AUCmat))
+
+AUC <- as.data.frame(AUCmat)
+AUC <- rownames_to_column(AUC)
+AUC <- AUC %>% filter(rowname %in% tfs)
+
+meta <- obj@meta.data
+meta <- meta %>% select("group")
+meta <- meta %>% rownames_to_column()
+
+AUC <- AUC %>% column_to_rownames(var = "rowname")
+AUC <- as.data.frame(t(AUC))
+AUC <- AUC %>% rownames_to_column()
+
+AUC_group <- left_join(AUC, meta)
+AUC_group <- AUC_group %>% column_to_rownames()
+
+ggplot(AUC_group, aes(x=group, y=KLF5, fill = group)) + 
+  geom_boxplot(show.legend = F) +
+  stat_compare_means(aes(label = ..p.signif..), label.x = 1.5, label.y = 0.13) +
+  theme_classic(base_size = 12, base_family = "Arial") +
+    theme(panel.background = element_rect(fill = "transparent"),
+      plot.background = element_rect(fill = "transparent", colour = NA))
+ggsave(paste(figure_dir, "KLF5_auc_plot.png", sep = ''), height = 125, width = 75, units = "mm", dpi = 300)
+
+ggplot(AUC_group, aes(x=group, y=ESRRA, fill = group)) + 
+  geom_boxplot(show.legend = F) +
+  stat_compare_means(aes(label = ..p.signif..), label.x = 1.5, label.y = 0.11)+
+  theme_classic(base_size = 12, base_family = "Arial") +
+    theme(panel.background = element_rect(fill = "transparent"),
+      plot.background = element_rect(fill = "transparent", colour = NA))
+ggsave(paste(figure_dir, "ESRRA_auc_plot.png", sep = ''), height = 125, width = 75, units = "mm", dpi = 300)
+
+ggplot(AUC_group, aes(x=group, y=HNF4G, fill=group)) + 
+  geom_boxplot(show.legend = F) +
+  stat_compare_means(aes(label = ..p.signif..), label.x = 1.5, label.y = 0.13) +
+  theme_classic(base_size = 12, base_family = "Arial") +
+    theme(panel.background = element_rect(fill = "transparent"),
+      plot.background = element_rect(fill = "transparent", colour = NA))
+ggsave(paste(figure_dir, "HNF4G_auc_plot.png", sep = ''), height = 125, width = 75, units = "mm", dpi = 300)
+
+ggplot(AUC_group, aes(x=group, y=HNF4A, fill=group)) + 
+  geom_boxplot(show.legend = F) +
+  stat_compare_means(aes(label = ..p.signif..), label.x = 1.5, label.y = 0.125) +
+  theme_classic(base_size = 12, base_family = "Arial") +
+    theme(panel.background = element_rect(fill = "transparent"),
+      plot.background = element_rect(fill = "transparent", colour = NA))
+ggsave(paste(figure_dir, "HNF4A_auc_plot.png", sep = ''), height = 125, width = 75, units = "mm", dpi = 300)
+
+#TF Expression by Cluster
+VlnPlot(no8, features = c("KLF5", "HNF4A", "HNF4G", "ESRRA"), cols = pal_names, ncol = 4, y.max = 4.5, group.by = "CellID")
+ggsave(paste0(figure_dir, "regulon_exp_clusters.png"), height = 150, width = 450, dpi = 300, units = 'mm')
+```
+
